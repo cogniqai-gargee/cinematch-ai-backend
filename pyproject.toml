@@ -1,0 +1,20 @@
+[project]
+name = "cinematch-ai-backend"
+version = "0.1.0"
+description = "FastAPI backend for CineMatch AI."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic-settings",
+  "httpx",
+  "supabase",
+  "python-dotenv",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["supabase*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
