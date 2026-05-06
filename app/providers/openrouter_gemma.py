@@ -1,33 +1,39 @@
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import time
 from typing import Any
-
+ 
 import httpx
-
+ 
 from app.config import Settings
 from app.providers.base import BaseLLMProvider, LLMRateLimitedError, LLMUnavailableError
 from app.schemas.chat import ChatMessage
 from app.schemas.movies import MovieCandidate, Recommendation
-
+ 
 logger = logging.getLogger(__name__)
 OPENROUTER_GEMMA_MODEL = "google/gemma-4-31b-it:free"
-LLM_COOLDOWN_SECONDS = 3.0
-RATE_LIMIT_RETRY_SECONDS = 2.0
-
-
+LLM_COOLDOWN_SECONDS    = 3.0
+RATE_LIMIT_RETRY_SECONDS = 12.0   # was 2.0 — needs real breathing room
+CACHE_TTL_SECONDS        = 300    # 5 minute response cache
+ 
+ 
 class OpenRouterGemmaProvider(BaseLLMProvider):
     name = "openrouter-gemma"
-
+ 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._cooldown_locks : dict[str, asyncio.Lock] = {}
+        self._cooldown_locks: dict[str, asyncio.Lock] = {}
         self._last_request_at_by_session: dict[str, float] = {}
+        self._response_cache: dict[str, tuple[float, str]] = {}
         logger.info("[LLM] Provider: OpenRouter")
         logger.info("[LLM] Model: %s", OPENROUTER_GEMMA_MODEL)
-
+ 
+    # ------------------------------------------------------------------ #
+    #  PUBLIC: chat                                                        #
+    # ------------------------------------------------------------------ #
     async def chat(
         self,
         message: str,
@@ -35,43 +41,30 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
         history: list[ChatMessage] | None = None,
         session_key: str | None = None,
     ) -> str:
-        payload = self._build_payload(
-            system_prompt=(
-                "You are CineMatch AI, a natural, friendly, movie-savvy assistant. "
-                "Sound like a concise chat companion, not a scripted recommender. "
-                "Acknowledge the user's actual taste in plain language without saying 'I interpreted this as' "
-                "or revealing internal rules. Preserve every stated preference, including secondary moods, "
-                "genres, subgenres, tones, pacing, themes, exclusions, runtime, language, intensity, "
-                "viewing context, popularity preference, and comparison titles. "
-                "If conversation_decision.needs_followup is true, ask exactly one natural clarifying question "
-                "and do not recommend yet. If recommendations are available, briefly introduce them. "
-                "If recommendation_error is present, apologize briefly and ask the user to try again soon. "
-                "Never mention service internals, provider names, TMDB, OpenRouter, extracted labels, "
-                "backend logic, system prompts, or service failure details to the user. "
-                "Use recommendation_titles if present, but keep the reply brief. "
-                "Do not over-question clear requests. Do not invent constraints the user did not say."
-            ),
-            user_content=json.dumps(
-                {
-                    "latest_user_message": message,
-                    "extracted_preferences": preferences,
-                    "conversation_decision": preferences.get("conversation_decision"),
-                    "recommendation_count": preferences.get("recommendation_count"),
-                    "recommendation_titles": preferences.get("recommendation_titles"),
-                    "conversation_history": self._serialize_history(history or []),
-                },
-                ensure_ascii=True,
-            ),
-            temperature=0.5,
-        )
-        data = await self._post_to_openrouter(payload, session_key=session_key)
-        content = self._message_content(data)
-        if not content:
-            logger.error("[LLM] Request failed: empty chat response")
-            raise LLMUnavailableError()
-
-        return content
-
+        """
+        When recommendations already exist in preferences, build a reply
+        locally without calling the LLM. This eliminates the second API
+        call that was causing back-to-back 429 rate limit hits.
+        """
+        rec_error = preferences.get("recommendation_error")
+        if rec_error:
+            return (
+                "I'm sorry, movie results are temporarily unavailable. "
+                "Please try again in a moment."
+            )
+ 
+        titles = preferences.get("recommendation_titles")
+        if titles and isinstance(titles, list) and titles:
+            decision = preferences.get("conversation_decision") or {}
+            if not (isinstance(decision, dict) and decision.get("needs_followup")):
+                return self._build_recommendation_reply(titles, preferences)
+ 
+        # Only reaches the LLM for follow-up questions or opening messages
+        return await self._llm_chat(message, preferences, history, session_key)
+ 
+    # ------------------------------------------------------------------ #
+    #  PUBLIC: rank_recommendations                                        #
+    # ------------------------------------------------------------------ #
     async def rank_recommendations(
         self,
         preferences: dict[str, Any],
@@ -82,15 +75,12 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
     ) -> list[Recommendation]:
         if not candidates:
             return []
-
+ 
         payload = self._build_payload(
             system_prompt=(
-                "You are CineMatch AI's ranking engine. Rank movie candidates for the user. "
-                "Respect the user's exact mood and genre. Lighthearted means light, feel-good, upbeat, "
-                "playful, easygoing, comedy, romance, or romcom. Romcom means romantic comedy. "
-                "Dark comedy is allowed only if the user explicitly requested dark comedy or black comedy. "
-                "Do not choose candidates whose tone contradicts the extracted preferences. "
-                "Return only valid JSON. Do not include markdown fences or commentary."
+                "You are CineMatch AI ranking engine. "
+                "Return ONLY valid JSON with no markdown fences, no commentary, nothing else. "
+                "The JSON must have exactly one key: 'recommendations'."
             ),
             user_content=json.dumps(
                 {
@@ -109,60 +99,122 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
                     },
                     "rules": [
                         "Use only movies from candidate_movies.",
-                        "Use all stated preferences together; do not reduce a multi-part request to one genre.",
-                        "Prefer candidates whose genres, subgenres, moods, tone, pacing, themes, runtime, language, era, intensity, and viewing context match extracted_preferences.",
-                        "Use liked_references and liked_elements as taste anchors.",
-                        "Avoid disliked_references, disliked_elements, and exclusions.",
-                        "Respect secondary preferences, not just the first genre or mood.",
-                        "If preferences combine multiple tones or genres, rank movies that best balance the combination.",
-                        "Do not add tones or constraints that are not in extracted_preferences.",
+                        "Prefer candidates matching genres, moods, tone, pacing, runtime, language.",
                         "Return at most the requested limit.",
-                        "match_score must be an integer from 0 to 100.",
+                        "match_score must be integer 0 to 100.",
                         "reason must be under 28 words.",
                         "watch_context must be under 18 words.",
+                        "Output ONLY the JSON object. No text before or after.",
                     ],
                     "limit": limit,
                     "extracted_preferences": preferences,
-                    "conversation_history": self._serialize_history(history or []),
-                    "candidate_movies": [self._serialize_candidate(movie) for movie in candidates],
+                    "candidate_movies": [self._serialize_candidate(m) for m in candidates],
                 },
                 ensure_ascii=True,
             ),
             temperature=0.2,
         )
-        data = await self._post_to_openrouter(payload, session_key=session_key)
-        parsed = self._parse_json_content(self._message_content(data))
+ 
+        cache_key = self._make_cache_key(payload)
+        cached_content = self._get_cached(cache_key)
+        if cached_content:
+            parsed = self._parse_json_content(cached_content)
+        else:
+            content = await self._post_and_get_content(payload, session_key)
+            self._set_cached(cache_key, content)
+            parsed = self._parse_json_content(content)
+ 
         recommendations = self._recommendations_from_json(parsed, candidates, limit)
         if recommendations:
-            logger.info("OpenRouterGemmaProvider ranked %s recommendations", len(recommendations))
+            logger.info("[LLM] Ranked %s recommendations", len(recommendations))
             return recommendations
-
-        logger.error("[LLM] Request failed: no usable rankings")
+ 
+        logger.error("[LLM] No usable rankings from response")
         raise LLMUnavailableError()
-
-    def _build_payload(
+ 
+    # ------------------------------------------------------------------ #
+    #  PRIVATE: local reply builder (no LLM call)                         #
+    # ------------------------------------------------------------------ #
+    def _build_recommendation_reply(
         self,
-        *,
-        system_prompt: str,
-        user_content: str,
-        temperature: float,
-        response_format: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "model": OPENROUTER_GEMMA_MODEL,
-            "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-        }
-
-        if response_format:
-            payload["response_format"] = response_format
-
-        return payload
-
-    async def _post_to_openrouter(self, payload: dict[str, Any], *, session_key: str | None) -> dict[str, Any]:
+        titles: list[str],
+        preferences: dict[str, Any],
+    ) -> str:
+        count = preferences.get("recommendation_count", len(titles))
+        genres = preferences.get("genres") or []
+        moods  = preferences.get("moods")  or []
+        language = preferences.get("language") or preferences.get("languages")
+ 
+        context_parts: list[str] = []
+        if genres:
+            g = genres if isinstance(genres, str) else ", ".join(genres[:2])
+            context_parts.append(g)
+        if moods:
+            m = moods if isinstance(moods, str) else moods[0]
+            context_parts.append(m)
+        if language and language not in ("en", "en-US", "English", "english"):
+            lang = language if isinstance(language, str) else language[0]
+            context_parts.append(f"{lang}-language")
+        context = " ".join(context_parts) if context_parts else "your vibe"
+ 
+        if len(titles) == 1:
+            return (
+                f"Based on {context}, here's my top pick: {titles[0]}. "
+                "Want more options or a different direction?"
+            )
+ 
+        listed = ", ".join(f'"{t}"' for t in titles[:3])
+        extra  = f" and {count - 3} more" if count > 3 else ""
+        return (
+            f"Here are {count} matches for {context}: {listed}{extra}. "
+            "The top pick is your best fit — want details on any, or shall I adjust the vibe?"
+        )
+ 
+    # ------------------------------------------------------------------ #
+    #  PRIVATE: actual LLM chat call (follow-ups only)                    #
+    # ------------------------------------------------------------------ #
+    async def _llm_chat(
+        self,
+        message: str,
+        preferences: dict[str, Any],
+        history: list[ChatMessage] | None,
+        session_key: str | None,
+    ) -> str:
+        payload = self._build_payload(
+            system_prompt=(
+                "You are CineMatch AI, a natural, friendly, movie-savvy assistant. "
+                "Sound like a concise chat companion, not a scripted recommender. "
+                "If you need more information, ask exactly one natural clarifying question. "
+                "Never mention TMDB, OpenRouter, or backend details. "
+                "Keep replies brief and conversational."
+            ),
+            user_content=json.dumps(
+                {
+                    "latest_user_message": message,
+                    "extracted_preferences": preferences,
+                    "conversation_decision": preferences.get("conversation_decision"),
+                    "conversation_history": self._serialize_history(history or []),
+                },
+                ensure_ascii=True,
+            ),
+            temperature=0.5,
+        )
+ 
+        cache_key = self._make_cache_key(payload)
+        cached = self._get_cached(cache_key)
+        if cached:
+            return cached
+ 
+        content = await self._post_and_get_content(payload, session_key)
+        self._set_cached(cache_key, content)
+        return content
+ 
+    # ------------------------------------------------------------------ #
+    #  PRIVATE: HTTP                                                       #
+    # ------------------------------------------------------------------ #
+    async def _post_and_get_content(
+        self, payload: dict[str, Any], session_key: str | None
+    ) -> str:
         headers = {
             "Authorization": f"Bearer {self.settings.gemma_api_key}",
             "Content-Type": "application/json",
@@ -170,196 +222,225 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
             "X-Title": "CineMatch AI",
         }
         await self._respect_cooldown(session_key)
-
-        async with httpx.AsyncClient(timeout=90) as client:
-            retried_after_rate_limit = False
+ 
+        async with httpx.AsyncClient(timeout=90) as client:  # was 40
             for attempt in range(2):
                 try:
-                    logger.info("[LLM] Request started")
-                    response = await client.post(self.settings.gemma_api_url, headers=headers, json=payload)
+                    logger.info("[LLM] Request started (attempt %s)", attempt + 1)
+                    response = await client.post(
+                        self.settings.gemma_api_url, headers=headers, json=payload
+                    )
                     response.raise_for_status()
-                    if attempt:
-                        logger.info("[LLM] Retry success")
                     logger.info("[LLM] Request success")
-                    return response.json()
+                    content = self._message_content(response.json())
+                    if not content:
+                        raise LLMUnavailableError()
+                    return content
+ 
                 except httpx.HTTPStatusError as exc:
                     if exc.response.status_code == 429:
-                        logger.warning("[LLM] Rate limit hit")
+                        logger.warning("[LLM] Rate limit hit (attempt %s)", attempt + 1)
                         if attempt == 0:
-                            retried_after_rate_limit = True
-                            logger.info("[LLM] Retry attempt")
+                            logger.info(
+                                "[LLM] Waiting %ss before retry", RATE_LIMIT_RETRY_SECONDS
+                            )
                             await asyncio.sleep(RATE_LIMIT_RETRY_SECONDS)
                             continue
-
-                        logger.error("[LLM] Retry failure")
-                        logger.error("[LLM] Request failed: %s", exc)
+                        logger.error("[LLM] Rate limit persists after retry")
                         raise LLMRateLimitedError() from exc
-
-                    if retried_after_rate_limit:
-                        logger.error("[LLM] Retry failure")
-                        logger.error("[LLM] Request failed: %s", exc)
-                        raise LLMRateLimitedError() from exc
-
-                    logger.error("[LLM] Request failed: %s", exc)
+                    logger.error("[LLM] HTTP error %s: %s", exc.response.status_code, exc)
                     raise LLMUnavailableError() from exc
+ 
+                except LLMUnavailableError:
+                    raise
                 except Exception as exc:
-                    if retried_after_rate_limit:
-                        logger.error("[LLM] Retry failure")
-                        logger.error("[LLM] Request failed: %s", exc)
-                        raise LLMRateLimitedError() from exc
-
-                    logger.error("[LLM] Request failed: %s", exc)
+                    logger.error("[LLM] Unexpected error: %s", exc)
                     raise LLMUnavailableError() from exc
-
-        logger.error("[LLM] Retry failure")
+ 
         raise LLMRateLimitedError()
-
+ 
+    # ------------------------------------------------------------------ #
+    #  PRIVATE: cache                                                      #
+    # ------------------------------------------------------------------ #
+    def _make_cache_key(self, payload: dict) -> str:
+        key_str = json.dumps(
+            payload.get("messages", []), sort_keys=True, ensure_ascii=True
+        )
+        return hashlib.sha256(key_str.encode()).hexdigest()[:20]
+ 
+    def _get_cached(self, key: str) -> str | None:
+        entry = self._response_cache.get(key)
+        if not entry:
+            return None
+        cached_at, content = entry
+        if time.monotonic() - cached_at > CACHE_TTL_SECONDS:
+            del self._response_cache[key]
+            return None
+        logger.info("[LLM] Cache hit — skipping API call")
+        return content
+ 
+    def _set_cached(self, key: str, content: str) -> None:
+        if len(self._response_cache) >= 100:
+            oldest = min(
+                self._response_cache,
+                key=lambda k: self._response_cache[k][0]
+            )
+            del self._response_cache[oldest]
+        self._response_cache[key] = (time.monotonic(), content)
+ 
+    # ------------------------------------------------------------------ #
+    #  PRIVATE: cooldown (per-session, not global)                        #
+    # ------------------------------------------------------------------ #
     async def _respect_cooldown(self, session_key: str | None) -> None:
         key = session_key or "anonymous"
         if key not in self._cooldown_locks:
-            self._cooldown_locks[key] = asyncio.Lock()                  
+            self._cooldown_locks[key] = asyncio.Lock()
         async with self._cooldown_locks[key]:
             now = time.monotonic()
             last = self._last_request_at_by_session.get(key)
             if last is not None:
                 wait = LLM_COOLDOWN_SECONDS - (now - last)
                 if wait > 0:
+                    logger.info("[LLM] Cooldown wait: %.1fs", wait)
                     await asyncio.sleep(wait)
-
             self._last_request_at_by_session[key] = time.monotonic()
-
+ 
+    # ------------------------------------------------------------------ #
+    #  PRIVATE: payload builder                                            #
+    # ------------------------------------------------------------------ #
+    def _build_payload(
+        self,
+        *,
+        system_prompt: str,
+        user_content: str,
+        temperature: float,
+    ) -> dict[str, Any]:
+        # NOTE: response_format intentionally omitted.
+        # Gemma free ignores it and wastes tokens trying to comply.
+        return {
+            "model": OPENROUTER_GEMMA_MODEL,
+            "temperature": temperature,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_content},
+            ],
+        }
+ 
+    # ------------------------------------------------------------------ #
+    #  PRIVATE: response parsing                                           #
+    # ------------------------------------------------------------------ #
     def _message_content(self, data: dict[str, Any]) -> str:
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             return ""
-
         message = choices[0].get("message")
         if not isinstance(message, dict):
             return ""
-
         content = message.get("content")
         return content if isinstance(content, str) else ""
-
+ 
     def _parse_json_content(self, content: str) -> dict[str, Any]:
         cleaned = content.strip()
         if not cleaned:
             return {}
-
-    # Strip any markdown fences
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE).strip()
-        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
-
+ 
+        # Strip markdown fences (Gemma often wraps JSON in ```json ... ```)
+        cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE).strip()
+        cleaned = re.sub(r'\s*```\s*$', '', cleaned).strip()
+ 
+        # Direct parse
         try:
-            return json.loads(cleaned)
+            parsed = json.loads(cleaned)
+            return parsed if isinstance(parsed, dict) else {}
         except json.JSONDecodeError:
             pass
-
-    # Extract first {...} block (handles preamble text)
-        match = re.search(r"\{[\s\S]*\}", cleaned)
+ 
+        # Extract first {...} block (handles preamble prose before JSON)
+        match = re.search(r'\{[\s\S]*\}', cleaned)
         if match:
             try:
-                return json.loads(match.group(0))
+                parsed = json.loads(match.group(0))
+                return parsed if isinstance(parsed, dict) else {}
             except json.JSONDecodeError:
                 pass
-
-        logger.error("[LLM] Could not parse JSON from response: %s", cleaned[:200])
+ 
+        logger.error("[LLM] Could not parse JSON. Raw[:300]: %s", cleaned[:300])
         raise LLMUnavailableError()
-
+ 
     def _recommendations_from_json(
         self,
         parsed: dict[str, Any],
         candidates: list[MovieCandidate],
         limit: int,
     ) -> list[Recommendation]:
-        raw_recommendations = parsed.get("recommendations", [])
-        if not isinstance(raw_recommendations, list):
+        raw = parsed.get("recommendations", [])
+        if not isinstance(raw, list):
             return []
-
-        by_id = {movie.id: movie for movie in candidates}
-        by_tmdb_id = {
-            movie.tmdb_id: movie
-            for movie in candidates
-            if movie.tmdb_id is not None
-        }
+ 
+        by_id   = {m.id: m for m in candidates}
+        by_tmdb = {m.tmdb_id: m for m in candidates if m.tmdb_id is not None}
         ranked: list[Recommendation] = []
-        seen_ids: set[str] = set()
-
-        for index, item in enumerate(raw_recommendations[:limit]):
+        seen: set[str] = set()
+ 
+        for i, item in enumerate(raw[:limit]):
             if not isinstance(item, dict):
                 continue
-
-            movie = self._match_candidate(item, by_id, by_tmdb_id)
-            if not movie or movie.id in seen_ids:
+            movie = self._match_candidate(item, by_id, by_tmdb)
+            if not movie or movie.id in seen:
                 continue
-
-            rank = self._safe_int(item.get("rank"), default=index + 1, minimum=1, maximum=limit)
-            score = self._safe_int(item.get("match_score"), default=88, minimum=0, maximum=100)
-            reason = str(item.get("reason") or f"{movie.title} fits your current preferences.").strip()
-            watch_context = str(item.get("watch_context") or "Best for tonight's watch.").strip()
-            ranked.append(
-                Recommendation(
-                    movie=movie,
-                    rank=rank,
-                    match_score=score,
-                    reason=reason[:220],
-                    watch_context=watch_context[:140],
-                    provider=self.name,
-                    model=OPENROUTER_GEMMA_MODEL,
-                )
-            )
-            seen_ids.add(movie.id)
-
-        return sorted(ranked, key=lambda recommendation: recommendation.rank)
-
+            rank  = self._safe_int(item.get("rank"),        default=i+1, minimum=1,   maximum=limit)
+            score = self._safe_int(item.get("match_score"), default=88,  minimum=0,   maximum=100)
+            reason    = str(item.get("reason")        or f"{movie.title} fits your preferences.").strip()
+            watch_ctx = str(item.get("watch_context") or "Best for tonight.").strip()
+            ranked.append(Recommendation(
+                movie=movie,
+                rank=rank,
+                match_score=score,
+                reason=reason[:220],
+                watch_context=watch_ctx[:140],
+                provider=self.name,
+                model=OPENROUTER_GEMMA_MODEL,
+            ))
+            seen.add(movie.id)
+ 
+        return sorted(ranked, key=lambda r: r.rank)
+ 
     def _match_candidate(
         self,
         item: dict[str, Any],
-        by_id: dict[str, MovieCandidate],
-        by_tmdb_id: dict[int, MovieCandidate],
+        by_id:   dict[str, MovieCandidate],
+        by_tmdb: dict[int, MovieCandidate],
     ) -> MovieCandidate | None:
         raw_id = item.get("id")
         if raw_id is not None and str(raw_id) in by_id:
             return by_id[str(raw_id)]
-
-        raw_tmdb_id = item.get("tmdb_id")
+        raw_tmdb = item.get("tmdb_id")
         try:
-            tmdb_id = int(raw_tmdb_id) if raw_tmdb_id is not None else None
+            tmdb_id = int(raw_tmdb) if raw_tmdb is not None else None
         except (TypeError, ValueError):
             tmdb_id = None
-
-        if tmdb_id is not None and tmdb_id in by_tmdb_id:
-            return by_tmdb_id[tmdb_id]
-
-        return None
-
+        return by_tmdb.get(tmdb_id) if tmdb_id is not None else None
+ 
     def _safe_int(self, value: Any, *, default: int, minimum: int, maximum: int) -> int:
         try:
-            parsed = int(value)
+            return min(max(int(value), minimum), maximum)
         except (TypeError, ValueError):
-            parsed = default
-
-        return min(max(parsed, minimum), maximum)
-
+            return default
+ 
     def _serialize_history(self, history: list[ChatMessage]) -> list[dict[str, str]]:
-        return [
-            {
-                "role": message.role,
-                "content": message.content,
-            }
-            for message in history[-12:]
-        ]
-
+        # Trimmed from 12 → 8 to keep payloads smaller and responses faster
+        return [{"role": m.role, "content": m.content} for m in history[-8:]]
+ 
     def _serialize_candidate(self, movie: MovieCandidate) -> dict[str, Any]:
         return {
-            "id": movie.id,
-            "tmdb_id": movie.tmdb_id,
-            "title": movie.title,
-            "year": movie.year,
-            "genres": movie.genres,
+            "id":             movie.id,
+            "tmdb_id":        movie.tmdb_id,
+            "title":          movie.title,
+            "year":           movie.year,
+            "genres":         movie.genres,
             "runtime_minutes": movie.runtime_minutes,
-            "language": movie.language,
-            "synopsis": movie.synopsis,
-            "rating": movie.rating,
-            "trailer_available": bool(movie.trailer_url or movie.trailer_key),
-            "is_fallback": movie.is_fallback,
+            "language":       movie.language,
+            # Truncated to 200 chars — reduces token count without losing ranking signal
+            "synopsis":       (movie.synopsis or "")[:200],
+            "rating":         movie.rating,
         }
