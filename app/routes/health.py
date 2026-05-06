@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 
 from app.config import get_settings
 from app.services import get_supabase_service
@@ -21,7 +21,17 @@ async def health() -> dict[str, object]:
         },
     }
 
+@router.head("/health")
+async def health_head():
+    return Response(status_code=200)
+
+
+
 @router.get("/ping")
 async def ping():
     """Lightweight keep-alive endpoint for uptime monitors."""
     return {"pong": True}
+
+@router.head("/ping")
+async def ping_head():
+    return Response(status_code=200)
