@@ -14,7 +14,12 @@ from app.schemas.chat import ChatMessage
 from app.schemas.movies import MovieCandidate, Recommendation
  
 logger = logging.getLogger(__name__)
-OPENROUTER_GEMMA_MODEL = "google/gemma-4-31b-it:free"
+# Primary model — try this first
+LLM_PRIMARY_MODEL   = "google/gemma-3-12b-it:free"
+# Fallback model — used automatically if primary hits 429 twice
+LLM_FALLBACK_MODEL  = "qwen/qwen-2.5-7b-instruct:free"
+
+OPENROUTER_GEMMA_MODEL = LLM_PRIMARY_MODEL
 LLM_COOLDOWN_SECONDS    = 3.0
 RATE_LIMIT_RETRY_SECONDS = 12.0   # was 2.0 — needs real breathing room
 CACHE_TTL_SECONDS        = 300    # 5 minute response cache
@@ -213,51 +218,81 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
     #  PRIVATE: HTTP                                                       #
     # ------------------------------------------------------------------ #
     async def _post_and_get_content(
-        self, payload: dict[str, Any], session_key: str | None
+        self,
+        payload: dict[str, Any],
+        session_key: str | None,
     ) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.settings.gemma_api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:8000",
-            "X-Title": "CineMatch AI",
-        }
+        """
+        Try the primary model first (2 attempts with retry wait).
+        If both fail with 429, automatically switch to the fallback model
+        and try once more — instead of raising to the caller.
+        """
         await self._respect_cooldown(session_key)
- 
-        async with httpx.AsyncClient(timeout=90) as client:  # was 40
-            for attempt in range(2):
-                try:
-                    logger.info("[LLM] Request started (attempt %s)", attempt + 1)
-                    response = await client.post(
-                        self.settings.gemma_api_url, headers=headers, json=payload
-                    )
-                    response.raise_for_status()
-                    logger.info("[LLM] Request success")
-                    content = self._message_content(response.json())
-                    if not content:
-                        raise LLMUnavailableError()
-                    return content
- 
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 429:
-                        logger.warning("[LLM] Rate limit hit (attempt %s)", attempt + 1)
-                        if attempt == 0:
-                            logger.info(
-                                "[LLM] Waiting %ss before retry", RATE_LIMIT_RETRY_SECONDS
+
+        models_to_try = [
+            (LLM_PRIMARY_MODEL, 2),    # primary: 2 attempts
+            (LLM_FALLBACK_MODEL, 1),   # fallback: 1 attempt
+        ]
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            for model, max_attempts in models_to_try:
+                current_payload = {**payload, "model": model}
+
+                for attempt in range(max_attempts):
+                    try:
+                        logger.info(
+                            "[LLM] Request started (model=%s attempt=%s)",
+                            model, attempt + 1,
+                        )
+                        response = await client.post(
+                            self.settings.gemma_api_url,
+                            headers={
+                                "Authorization": f"Bearer {self.settings.gemma_api_key}",
+                                "Content-Type": "application/json",
+                                "HTTP-Referer": "https://cinematch.app",
+                                "X-Title": "CineMatch AI",
+                            },
+                            json=current_payload,
+                        )
+                        response.raise_for_status()
+                        data = response.json()
+                        content = self._message_content(data)
+                        if content:
+                            logger.info("[LLM] Request success (model=%s)", model)
+                            return content
+                        raise ValueError("Empty content from model")
+
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 429:
+                            logger.warning(
+                                "[LLM] Rate limit hit (model=%s attempt=%s)",
+                                model, attempt + 1,
                             )
-                            await asyncio.sleep(RATE_LIMIT_RETRY_SECONDS)
-                            continue
-                        logger.error("[LLM] Rate limit persists after retry")
-                        raise LLMRateLimitedError() from exc
-                    logger.error("[LLM] HTTP error %s: %s", exc.response.status_code, exc)
-                    raise LLMUnavailableError() from exc
- 
-                except LLMUnavailableError:
-                    raise
-                except Exception as exc:
-                    logger.error("[LLM] Unexpected error: %s", exc)
-                    raise LLMUnavailableError() from exc
- 
-        raise LLMRateLimitedError()
+                            if attempt < max_attempts - 1:
+                                logger.info(
+                                    "[LLM] Waiting %ss before retry",
+                                    RATE_LIMIT_RETRY_SECONDS,
+                                )
+                                await asyncio.sleep(RATE_LIMIT_RETRY_SECONDS)
+                            else:
+                                logger.warning(
+                                    "[LLM] Switching to fallback model after %s failed",
+                                    model,
+                                )
+                                break  # try next model
+                        else:
+                            logger.error(
+                                "[LLM] HTTP error %s from model %s",
+                                exc.response.status_code, model,
+                            )
+                            break  # try next model
+
+                    except Exception as exc:
+                        logger.error("[LLM] Unexpected error from model %s: %s", model, exc)
+                        break  # try next model
+
+        logger.error("[LLM] All models exhausted — raising LLMUnavailableError")
+        raise LLMUnavailableError()
  
     # ------------------------------------------------------------------ #
     #  PRIVATE: cache                                                      #
@@ -319,6 +354,7 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
         # Gemma free ignores it and wastes tokens trying to comply.
         return {
             "model": OPENROUTER_GEMMA_MODEL,
+            "max_tokens": 600,
             "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system_prompt},

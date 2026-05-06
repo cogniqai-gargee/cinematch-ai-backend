@@ -20,3 +20,8 @@ async def health() -> dict[str, object]:
             "supabase": supabase_status,
         },
     }
+
+@router.get("/ping")
+async def ping():
+    """Lightweight keep-alive endpoint for uptime monitors."""
+    return {"pong": True}
