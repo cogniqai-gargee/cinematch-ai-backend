@@ -3,7 +3,14 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routes import chat_router, health_router, recommendations_router, saved_movies_router
+from app.routes import (
+    chat_router,
+    discover_router,
+    health_router,
+    movies_router,
+    recommendations_router,
+    saved_movies_router,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,8 +19,8 @@ logging.basicConfig(
 
 app = FastAPI(
     title="CineMatch AI Backend",
-    version="0.1.0",
-    description="Mock-ready FastAPI backend for the CineMatch AI Expo app.",
+    version="0.2.0",
+    description="CineMatch AI — powered by Google AI Studio Gemma 4.",
 )
 
 app.add_middleware(
@@ -26,5 +33,7 @@ app.add_middleware(
 
 app.include_router(health_router)
 app.include_router(chat_router)
+app.include_router(discover_router)
+app.include_router(movies_router)
 app.include_router(recommendations_router)
 app.include_router(saved_movies_router)

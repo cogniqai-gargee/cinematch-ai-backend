@@ -561,3 +561,71 @@ class TMDBService:
             "url": f"{YOUTUBE_WATCH_BASE_URL}?v={key}",
             "source": "YouTube",
         }
+    
+    async def fetch_trending(self, *, limit: int = 20) -> list[MovieCandidate]:
+        """Trending movies this week."""
+        data = await self._get("/trending/movie/week", {"language": "en-US"})
+        movies = self._normalize_results(data.get("results", []))
+        return await self._with_trailers(movies[:limit])
+
+    async def fetch_new_releases(self, *, limit: int = 20) -> list[MovieCandidate]:
+        """Movies released in the past 90 days."""
+        from datetime import datetime, timedelta
+        today = datetime.utcnow().date()
+        ninety_days_ago = today - timedelta(days=90)
+        return await self._discover(
+            {
+                "primary_release_date.gte": str(ninety_days_ago),
+                "primary_release_date.lte": str(today),
+                "sort_by": "popularity.desc",
+                "vote_count.gte": 30,
+            },
+            limit=limit,
+        )
+
+    async def fetch_top_rated(self, *, limit: int = 20) -> list[MovieCandidate]:
+        """All-time top rated."""
+        return await self._discover(
+            {
+                "sort_by": "vote_average.desc",
+                "vote_count.gte": 1000,
+                "vote_average.gte": 7.5,
+            },
+            limit=limit,
+        )
+
+    async def fetch_watch_providers(
+        self,
+        movie_id: int,
+        *,
+        country: str = "IN",
+    ) -> dict:
+        """
+        Returns watch providers for a movie in the given country.
+        Returns a dict with keys: streaming, rent, buy — each a list of provider dicts.
+        """
+        try:
+            data = await self._get(f"/movie/{movie_id}/watch/providers", {})
+            results = data.get("results", {})
+            country_data = results.get(country.upper(), {})
+
+            def normalize_providers(raw: list) -> list[dict]:
+                return [
+                    {
+                        "id":       p.get("provider_id"),
+                        "name":     p.get("provider_name"),
+                        "logoUrl":  self._image_url(p.get("logo_path")),
+                    }
+                    for p in raw
+                    if isinstance(p, dict) and p.get("provider_name")
+                ]
+
+            return {
+                "streaming": normalize_providers(country_data.get("flatrate", [])),
+                "rent":      normalize_providers(country_data.get("rent", [])),
+                "buy":       normalize_providers(country_data.get("buy", [])),
+                "link":      country_data.get("link"),
+            }
+        except Exception as exc:
+            logger.warning("Watch providers fetch failed movie_id=%s error=%s", movie_id, exc)
+            return {"streaming": [], "rent": [], "buy": [], "link": None}
