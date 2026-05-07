@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     supabase_anon_key: str = ""
     gemma_api_url: str = "https://openrouter.ai/api/v1/chat/completions"
     gemma_api_key: str = ""
-    gemma_model: str = "google/gemma-4-31b-it:free"
+    gemma_model: str = "google/gemma-4-26b-a4b-it:free"
 
     model_config = SettingsConfigDict(
         env_file=str(Path(__file__).resolve().parents[1] / ".env"),

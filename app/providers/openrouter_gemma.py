@@ -15,9 +15,9 @@ from app.schemas.movies import MovieCandidate, Recommendation
  
 logger = logging.getLogger(__name__)
 # Primary model — try this first
-LLM_PRIMARY_MODEL   = "google/gemma-3-12b-it:free"
+LLM_PRIMARY_MODEL   = "google/gemma-4-26b-a4b-it:free"
 # Fallback model — used automatically if primary hits 429 twice
-LLM_FALLBACK_MODEL  = "qwen/qwen-2.5-7b-instruct:free"
+LLM_FALLBACK_MODEL  = "tencent/hy3-preview:free"
 
 OPENROUTER_GEMMA_MODEL = LLM_PRIMARY_MODEL
 LLM_COOLDOWN_SECONDS    = 3.0
@@ -34,7 +34,8 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
         self._last_request_at_by_session: dict[str, float] = {}
         self._response_cache: dict[str, tuple[float, str]] = {}
         logger.info("[LLM] Provider: OpenRouter")
-        logger.info("[LLM] Model: %s", OPENROUTER_GEMMA_MODEL)
+        logger.info("[LLM] Primary model: %s", LLM_PRIMARY_MODEL)
+        logger.info("[LLM] Fallback model: %s", LLM_FALLBACK_MODEL)
  
     # ------------------------------------------------------------------ #
     #  PUBLIC: chat                                                        #
@@ -263,7 +264,16 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
                         raise ValueError("Empty content from model")
 
                     except httpx.HTTPStatusError as exc:
-                        if exc.response.status_code == 429:
+                        status = exc.response.status_code
+                        if status == 404:
+                            # Model ID is wrong — do not retry, skip to next model immediately
+                            logger.error(
+                                "[LLM] Model not found (404) — model ID is wrong: %s "
+                                "— go to openrouter.ai to get the correct ID",
+                                model,
+                            )
+                            break
+                        elif status == 429:
                             logger.warning(
                                 "[LLM] Rate limit hit (model=%s attempt=%s)",
                                 model, attempt + 1,
@@ -276,16 +286,15 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
                                 await asyncio.sleep(RATE_LIMIT_RETRY_SECONDS)
                             else:
                                 logger.warning(
-                                    "[LLM] Switching to fallback model after %s failed",
-                                    model,
+                                    "[LLM] Rate limit persists — switching to fallback",
                                 )
-                                break  # try next model
+                                break
                         else:
                             logger.error(
-                                "[LLM] HTTP error %s from model %s",
-                                exc.response.status_code, model,
+                                "[LLM] HTTP %s from model %s — response: %s",
+                                status, model, exc.response.text[:200],
                             )
-                            break  # try next model
+                            break
 
                     except Exception as exc:
                         logger.error("[LLM] Unexpected error from model %s: %s", model, exc)
