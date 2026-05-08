@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,3 +29,7 @@ class Settings(BaseSettings):
     @property
     def has_ai_credentials(self) -> bool:
         return bool(self.gemma_primary_api_key)
+    
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
