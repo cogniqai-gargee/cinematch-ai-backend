@@ -88,44 +88,35 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
             return []
 
         system_prompt = (
-            "You are CineMatch AI ranking engine. "
-            "Return ONLY valid JSON with no markdown fences, no commentary, nothing else. "
-            "The JSON must have exactly one key: 'recommendations'."
+            "You are a JSON-only response engine. "
+            "CRITICAL: You MUST respond with ONLY valid JSON, nothing else. "
+            "No markdown, no explanation, no text before or after. "
+            "Invalid: markdown fences, bullet points, text, numbers. "
+            "Valid: only raw JSON object with key 'recommendations' containing an array. "
+            "If you cannot respond with valid JSON only, return empty array."
         )
-        user_content = json.dumps(
-            {
-                "task": "Rank these TMDB movie candidates for the user.",
-                "required_json_shape": {
-                    "recommendations": [
-                        {
-                            "id": "candidate id",
-                            "tmdb_id": "candidate tmdb id or null",
-                            "rank": 1,
-                            "match_score": 95,
-                            "reason": "short user-facing reason",
-                            "watch_context": "short watch context",
-                        }
-                    ]
-                },
-                "rules": [
-                    "Use only movies from candidate_movies.",
-                    "Prefer candidates matching genres, moods, tone, pacing, runtime, language.",
-                    "Return at most the requested limit.",
-                    "match_score must be integer 0 to 100.",
-                    "reason must be under 28 words.",
-                    "watch_context must be under 18 words.",
-                    "Output ONLY the JSON object. No text before or after.",
-                ],
-                "limit": limit,
-                "extracted_preferences": preferences,
-                "candidate_movies": [self._serialize_candidate(m) for m in candidates],
-            },
-            ensure_ascii=True,
-        )
+        
+        # Format user message with clear INPUT/OUTPUT separation to prevent model confusion
+        user_content = f"""INPUTS:
+User Preferences: {json.dumps(preferences, ensure_ascii=True)}
+Candidate Movies: {json.dumps([self._serialize_candidate(m) for m in candidates], ensure_ascii=True)}
+Limit: {limit}
+
+TASK: Rank the candidate movies based on user preferences. Select up to {limit} movies.
+
+OUTPUT REQUIREMENTS:
+- Must be ONLY a valid JSON object
+- Key: "recommendations" (array)
+- Each item: {{"id": candidate_id, "tmdb_id": tmdb_id_or_null, "rank": 1-{limit}, "match_score": 0-100, "reason": "under 28 words", "watch_context": "under 18 words"}}
+- match_score: integer 0-100 based on genre/mood/tone/runtime match
+- Only use candidates from the input list
+- No text, no markdown, no explanation—ONLY JSON"""
+        
+        user_content_json = user_content
 
         payload = self._build_payload(
             system_prompt=system_prompt,
-            user_content=user_content,
+            user_content=user_content_json,
             temperature=0.2,
         )
 
@@ -450,22 +441,34 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
         if not cleaned:
             return {}
 
+        # Remove markdown code fences if present
         cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.IGNORECASE).strip()
         cleaned = re.sub(r'\s*```\s*$', '', cleaned).strip()
 
+        # Try direct JSON parse first
         try:
             parsed = json.loads(cleaned)
-            return parsed if isinstance(parsed, dict) else {}
+            if isinstance(parsed, dict):
+                logger.info("[LLM] JSON parsed successfully")
+                return parsed
         except json.JSONDecodeError:
             pass
 
-        match = re.search(r'\{[\s\S]*\}', cleaned)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                return parsed if isinstance(parsed, dict) else {}
-            except json.JSONDecodeError:
-                pass
+        # Try to extract JSON object from content (handles cases where model adds text before/after)
+        # Look for the first { and last } that form valid JSON
+        for start_idx in range(len(cleaned)):
+            if cleaned[start_idx] == '{':
+                for end_idx in range(len(cleaned), start_idx, -1):
+                    if cleaned[end_idx - 1] == '}':
+                        candidate = cleaned[start_idx:end_idx]
+                        try:
+                            parsed = json.loads(candidate)
+                            if isinstance(parsed, dict):
+                                logger.info("[LLM] JSON extracted from position %d", start_idx)
+                                return parsed
+                        except json.JSONDecodeError:
+                            continue
+                break
 
         logger.error("[LLM] Could not parse JSON. Raw[:300]: %s", cleaned[:300])
         raise LLMUnavailableError()
