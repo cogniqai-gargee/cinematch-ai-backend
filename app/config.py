@@ -25,10 +25,26 @@ class Settings(BaseSettings):
     @property
     def has_tmdb_credentials(self) -> bool:
         return bool(self.tmdb_api_key)
+    
+    @property
+    def has_supabase_credentials(self) -> bool:
+        return bool(self.supabase_url and self.supabase_anon_key)
+
+    @property
+    def has_gemma_credentials(self) -> bool:
+        return bool(self.gemma_primary_api_key or self.gemma_fallback_api_key)
 
     @property
     def has_ai_credentials(self) -> bool:
         return bool(self.gemma_primary_api_key)
+    
+    @property
+    def primary_model(self) -> str:
+        return "gemma-4-31b-it"
+
+    @property
+    def fallback_model(self) -> str:
+        return "gemma-4-26b-a4b-it"
     
 @lru_cache
 def get_settings() -> Settings:
