@@ -40,7 +40,7 @@ class RecommendationRequest(BaseModel):
     conversation_id: str | None = None
     message: str | None = None
     preferences: dict[str, Any] = Field(default_factory=dict)
-    limit: int = Field(default=5, ge=1, le=10)
+    limit: int = Field(default=3, ge=1, le=10)
 
 
 class RecommendationResponse(BaseModel):

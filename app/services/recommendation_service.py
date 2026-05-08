@@ -28,7 +28,7 @@ class RecommendationService:
         preferences: dict[str, Any],
         conversation_id: str | None = None,
         message: str | None = None,
-        limit: int = 5,
+        limit: int = 3,
         history: list[ChatMessage] | None = None,
     ) -> RecommendationResponse:
         response_conversation_id = conversation_id or str(uuid4())
@@ -36,7 +36,7 @@ class RecommendationService:
         if message:
             merged_preferences.update(self.preference_service.extract([message]))
 
-        candidates = await self.tmdb_service.fetch_candidates(merged_preferences, limit=max(limit, 5))
+        candidates = await self.tmdb_service.fetch_candidates(merged_preferences, limit=max(limit, 10))
 
         logger.info("Extracted preferences: %s", merged_preferences)
         logger.info("TMDB query used: %s", self.tmdb_service.last_query)
@@ -74,7 +74,7 @@ class RecommendationService:
         message: str,
         history: list[ChatMessage],
         conversation_id: str | None,
-        limit: int = 5,
+        limit: int = 3,
     ) -> RecommendationResponse:
         texts = [item.content for item in history if item.role == "user"] + [message]
         preferences = self.preference_service.extract(texts)

@@ -16,6 +16,18 @@ class LLMUnavailableError(RuntimeError):
         self.message = message
 
 
+class LLMFormatError(LLMUnavailableError):
+    """Model responded, but the output was not in the expected format."""
+
+    def __init__(
+        self,
+        message: str = "AI response format was invalid",
+        raw_snippet: str = "",
+    ):
+        super().__init__(message=message, error="LLM_FORMAT_ERROR")
+        self.raw_snippet = raw_snippet
+
+
 class LLMRateLimitedError(LLMUnavailableError):
     def __init__(
         self,

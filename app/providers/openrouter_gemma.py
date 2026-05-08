@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
-from app.providers.base import BaseLLMProvider, LLMRateLimitedError, LLMUnavailableError
+from app.providers.base import BaseLLMProvider, LLMFormatError, LLMRateLimitedError, LLMUnavailableError
 from app.schemas.chat import ChatMessage
 from app.schemas.movies import MovieCandidate, Recommendation
 
@@ -87,6 +87,9 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
         if not candidates:
             return []
 
+        # Cap the LLM ranking at 3 for reliability; we still receive more candidates
+        # from TMDB so the deterministic fallback has options.
+        effective_limit = min(limit, 3)
         candidates_data = [self._serialize_candidate(m) for m in candidates]
 
         system_prompt = (
@@ -101,22 +104,21 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
                 "task": "rank_movies",
                 "preferences": preferences,
                 "candidate_movies": candidates_data,
-                "limit": limit,
-                "response_example": {
+                "limit": effective_limit,
+                "output_format": {
                     "recommendations": [
                         {
-                            "id": "123",
-                            "tmdb_id": 456,
-                            "rank": 1,
-                            "match_score": 95,
-                            "reason": "Strong match for user preferences.",
-                            "watch_context": "Best for tonight.",
+                            "id": "string",
+                            "tmdb_id": "number or null",
+                            "rank": "integer 1-3",
+                            "match_score": "integer 0-100",
+                            "reason": "string",
                         }
                     ]
                 },
                 "instructions": (
-                    "Respond with EXACTLY one JSON object matching the response_example. "
-                    "No text before or after. No markdown. No explanation. No bullets."
+                    "Output EXACTLY one valid JSON object with a single key named 'recommendations'."
+                    f" Return exactly {effective_limit} movies. No markdown, no commentary, no text outside the JSON."
                 ),
             },
             ensure_ascii=True,
@@ -128,73 +130,109 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
             temperature=0.0,
         )
 
+        # ── Attempt chain: LLM parse → retry → fallback model → deterministic ──
+        parsed: dict[str, Any] | None = None
+
         cache_key = self._make_cache_key(payload)
         cached_content = self._get_cached(cache_key)
         if cached_content:
-            parsed = self._parse_json_content(cached_content)
-        else:
-            content = await self._post_and_get_content(payload, session_key)
             try:
-                parsed = self._parse_json_content(content)
+                parsed = self._parse_json_content(cached_content, candidates)
+            except LLMFormatError:
+                parsed = None
+
+        if parsed is None:
+            try:
+                content = await self._post_and_get_content(payload, session_key)
+                parsed = self._parse_json_content(content, candidates)
                 self._set_cached(cache_key, content)
-            except LLMUnavailableError:
+            except LLMFormatError:
                 logger.warning(
                     "[LLM] First ranking response invalid; retrying with stricter JSON-only prompt"
                 )
-                retry_user_content = json.dumps(
-                    {
-                        "task": "rank_movies_retry",
-                        "error": "Previous response was not valid JSON.",
-                        "preferences": preferences,
-                        "candidate_movies": candidates_data,
-                        "limit": limit,
-                        "instructions": (
-                            "Respond with EXACTLY one valid JSON object and nothing else. "
-                            "Do not include any text, markdown, bullet points, or explanation."
-                        ),
-                        "response_example": {
-                            "recommendations": [
-                                {
-                                    "id": "123",
-                                    "tmdb_id": 456,
-                                    "rank": 1,
-                                    "match_score": 95,
-                                    "reason": "Strong match for user preferences.",
-                                    "watch_context": "Best for tonight.",
-                                }
-                            ]
-                        },
-                    },
-                    ensure_ascii=True,
-                )
-                retry_payload = self._build_payload(
-                    system_prompt=system_prompt,
-                    user_content=retry_user_content,
-                    temperature=0.0,
-                )
-                retry_content = await self._post_and_get_content(retry_payload, session_key)
                 try:
-                    parsed = self._parse_json_content(retry_content)
+                    retry_user_content = json.dumps(
+                        {
+                            "task": "rank_movies_retry",
+                            "error": "Previous response was not valid JSON.",
+                            "preferences": preferences,
+                            "candidate_movies": candidates_data,
+                            "limit": effective_limit,
+                            "output_format": {
+                                "recommendations": [
+                                    {
+                                        "id": "string",
+                                        "tmdb_id": "number or null",
+                                        "rank": "integer",
+                                        "match_score": "integer 0-100",
+                                        "reason": "string",
+                                    }
+                                ]
+                            },
+                            "instructions": (
+                                "Respond with EXACTLY one valid JSON object and nothing else. "
+                                "Do not include any text, markdown, bullet points, or explanation. "
+                                f"Return exactly {effective_limit} movies."
+                            ),
+                        },
+                        ensure_ascii=True,
+                    )
+                    retry_payload = self._build_payload(
+                        system_prompt=system_prompt,
+                        user_content=retry_user_content,
+                        temperature=0.0,
+                    )
+                    retry_content = await self._post_and_get_content(retry_payload, session_key)
+                    parsed = self._parse_json_content(retry_content, candidates)
                     self._set_cached(cache_key, retry_content)
-                except LLMUnavailableError:
+                except LLMFormatError:
                     logger.warning(
-                        "[LLM] Retry response invalid; trying fallback model with same strict instructions"
+                        "[LLM] Retry response invalid; trying fallback model"
                     )
-                    fallback_content = await self._post_and_get_content(
-                        retry_payload,
-                        session_key,
-                        fallback_only=True,
+                    try:
+                        fallback_content = await self._post_and_get_content(
+                            retry_payload,
+                            session_key,
+                            fallback_only=True,
+                        )
+                        parsed = self._parse_json_content(fallback_content, candidates)
+                        self._set_cached(cache_key, fallback_content)
+                    except (LLMFormatError, LLMUnavailableError):
+                        logger.warning(
+                            "[LLM] All LLM attempts failed format validation; "
+                            "falling through to deterministic ranking"
+                        )
+                        parsed = None
+                except LLMUnavailableError:
+                    # Provider itself is down — still fall through to deterministic
+                    logger.warning(
+                        "[LLM] Provider unavailable on retry; "
+                        "falling through to deterministic ranking"
                     )
-                    parsed = self._parse_json_content(fallback_content)
-                    self._set_cached(cache_key, fallback_content)
+                    parsed = None
+            except LLMUnavailableError:
+                # Provider itself is down on first attempt
+                logger.warning(
+                    "[LLM] Provider unavailable; falling through to deterministic ranking"
+                )
+                parsed = None
+            except Exception as exc:
+                logger.warning(
+                    "[LLM] Unexpected ranking exception; falling through to deterministic ranking: %s",
+                    exc,
+                )
+                parsed = None
 
-        recommendations = self._recommendations_from_json(parsed, candidates, limit)
-        if recommendations:
-            logger.info("[LLM] Ranked %s recommendations", len(recommendations))
-            return recommendations
+        # ── Extract recommendations from parsed JSON ──
+        if parsed is not None:
+            recommendations = self._recommendations_from_json(parsed, candidates, effective_limit)
+            if recommendations:
+                logger.info("[LLM] Ranked %s recommendations via LLM", len(recommendations))
+                return recommendations
 
-        logger.error("[LLM] No usable rankings from response")
-        raise LLMUnavailableError()
+        # ── Deterministic fallback — user always gets results ──
+        logger.info("[LLM] Using deterministic fallback ranker")
+        return self._deterministic_rank(candidates, preferences, effective_limit)
 
     # ------------------------------------------------------------------ #
     #  PRIVATE: local reply builder (no LLM call)                         #
@@ -229,10 +267,13 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
 
         listed = ", ".join(f'"{t}"' for t in titles[:3])
         extra  = f" and {count - 3} more" if count > 3 else ""
+        display_titles = titles[:3]
+        listed = ", ".join(f'"{t}"' for t in display_titles)
+
         return (
-            f"Here are {count} matches for {context}: {listed}{extra}. "
-            "The top pick is your best fit — want details on any, or shall I adjust the vibe?"
-        )
+            f"Here are my top {len(display_titles)} picks for {context}: {listed}. "
+            "Tap any movie to view the trailer, save it, mark it watched, or check where to watch."
+      )
 
     # ------------------------------------------------------------------ #
     #  PRIVATE: actual LLM chat call (follow-ups only)                    #
@@ -500,7 +541,11 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
     # ------------------------------------------------------------------ #
     #  PRIVATE: response parsing                                           #
     # ------------------------------------------------------------------ #
-    def _parse_json_content(self, content: str) -> dict[str, Any]:
+    def _parse_json_content(
+        self,
+        content: str,
+        candidates: list[MovieCandidate] | None = None,
+    ) -> dict[str, Any]:
         cleaned = content.strip()
         if not cleaned:
             return {}
@@ -524,9 +569,9 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
             if cleaned[start_idx] == '{':
                 for end_idx in range(len(cleaned), start_idx, -1):
                     if cleaned[end_idx - 1] == '}':
-                        candidate = cleaned[start_idx:end_idx]
+                        json_candidate = cleaned[start_idx:end_idx]
                         try:
-                            parsed = json.loads(candidate)
+                            parsed = json.loads(json_candidate)
                             if isinstance(parsed, dict):
                                 logger.info("[LLM] JSON extracted from position %d", start_idx)
                                 return parsed
@@ -534,8 +579,65 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
                             continue
                 break
 
+        # Try to extract a JSON array (model might return [...] without wrapper)
+        array_match = re.search(r'\[\s*\{.*?\}\s*(?:,\s*\{.*?\}\s*)*\]', cleaned, re.DOTALL)
+        if array_match:
+            try:
+                arr = json.loads(array_match.group())
+                if isinstance(arr, list) and arr:
+                    logger.info("[LLM] JSON array extracted from prose, wrapping as recommendations")
+                    return {"recommendations": arr}
+            except json.JSONDecodeError:
+                pass
+
+        # Last resort: try to build recommendations from prose by matching candidate titles
+        if candidates:
+            extracted = self._extract_ranking_from_prose(cleaned, candidates)
+            if extracted:
+                logger.info("[LLM] Built %d recommendations from prose extraction", len(extracted))
+                return {"recommendations": extracted}
+
         logger.error("[LLM] Could not parse JSON. Raw[:300]: %s", cleaned[:300])
-        raise LLMUnavailableError()
+        raise LLMFormatError(raw_snippet=cleaned[:300])
+
+    def _extract_ranking_from_prose(
+        self,
+        text: str,
+        candidates: list[MovieCandidate],
+    ) -> list[dict[str, Any]]:
+        """
+        Attempt to find candidate movie titles in a prose/markdown response
+        and build a synthetic recommendations list from the order they appear.
+        """
+        text_lower = text.lower()
+        found: list[tuple[int, MovieCandidate]] = []
+
+        for movie in candidates:
+            title_lower = movie.title.lower()
+            # Match exact title or title in quotes
+            pos = text_lower.find(f'"{title_lower}"')
+            if pos == -1:
+                pos = text_lower.find(title_lower)
+            if pos >= 0 and movie.id not in {m.id for _, m in found}:
+                found.append((pos, movie))
+
+        if not found:
+            return []
+
+        # Sort by position in text (first mentioned = highest rank)
+        found.sort(key=lambda x: x[0])
+
+        results: list[dict[str, Any]] = []
+        for rank, (_, movie) in enumerate(found[:3], start=1):
+            results.append({
+                "id": movie.id,
+                "tmdb_id": movie.tmdb_id,
+                "rank": rank,
+                "match_score": max(95 - (rank - 1) * 8, 70),
+                "reason": f"{movie.title} matches your preferences.",
+                "watch_context": "Great pick for tonight.",
+            })
+        return results
 
     def _recommendations_from_json(
         self,
@@ -574,6 +676,84 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
             seen.add(movie.id)
 
         return sorted(ranked, key=lambda r: r.rank)
+
+    def _deterministic_rank(
+        self,
+        candidates: list[MovieCandidate],
+        preferences: dict[str, Any],
+        limit: int,
+    ) -> list[Recommendation]:
+        """
+        Rank candidates without any LLM call using a weighted scoring formula.
+        This ensures the user always gets recommendations even when the model
+        returns unusable output.
+        """
+        preferred_genres: set[str] = set()
+        for g in (preferences.get("genres") or []):
+            if isinstance(g, str):
+                preferred_genres.add(g.lower())
+        genre_str = preferences.get("genre")
+        if isinstance(genre_str, str) and not preferred_genres:
+            preferred_genres.update(
+                g.strip().lower() for g in genre_str.split("+")
+            )
+
+        prefer_recent = preferences.get("era") == "recent" or preferences.get("popularity_preference") == "new"
+
+        scored: list[tuple[float, int, MovieCandidate]] = []
+        for position, movie in enumerate(candidates):
+            # Genre match: fraction of preferred genres present (0-1)
+            movie_genres_lower = {g.lower() for g in movie.genres}
+            if preferred_genres:
+                genre_overlap = len(preferred_genres & movie_genres_lower) / len(preferred_genres)
+            else:
+                genre_overlap = 0.5  # neutral if no preference
+
+            # Rating: normalized 0-1
+            rating_score = (movie.rating or 5.0) / 10.0
+
+            # Position: TMDB discover returns by popularity; earlier = better
+            total = max(len(candidates), 1)
+            position_score = 1.0 - (position / total)
+
+            # Recency bonus
+            recency_score = 0.5
+            if prefer_recent and movie.year:
+                if movie.year >= 2020:
+                    recency_score = 1.0
+                elif movie.year >= 2015:
+                    recency_score = 0.7
+
+            # Weighted composite
+            composite = (
+                genre_overlap   * 40 +
+                rating_score    * 30 +
+                position_score  * 20 +
+                recency_score   * 10
+            )
+            scored.append((composite, position, movie))
+
+        scored.sort(key=lambda x: -x[0])
+
+        results: list[Recommendation] = []
+        for rank, (score, _, movie) in enumerate(scored[:limit], start=1):
+            match_pct = min(int(score), 100)
+            genre_list = ", ".join(movie.genres[:2]) if movie.genres else "your taste"
+            results.append(Recommendation(
+                movie=movie,
+                rank=rank,
+                match_score=match_pct,
+                reason=f"{movie.title} is a strong {genre_list} pick.",
+                watch_context="Great choice for tonight.",
+                provider=f"{self.name}-deterministic",
+                model="deterministic",
+            ))
+
+        logger.info(
+            "[LLM] Deterministic fallback produced %d recommendations",
+            len(results),
+        )
+        return results
 
     def _match_candidate(
         self,

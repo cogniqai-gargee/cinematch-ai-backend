@@ -40,7 +40,21 @@ async def chat(payload: ChatRequest) -> ChatResponse | JSONResponse:
     user_texts = [m.content for m in payload.history if m.role == "user"] + [payload.message]
  
     extracted_preferences = preference_service.extract(user_texts)
-    decision              = preference_service.assess(payload.message, extracted_preferences)
+    decision = preference_service.assess(payload.message, extracted_preferences)
+
+    assistant_question_count = sum(
+       1
+       for message in payload.history
+       if message.role == "assistant" and "?" in message.content
+   )
+
+    if assistant_question_count >= 2:
+        decision["ready"] = True
+        decision["needs_followup"] = False
+        decision["question"] = None
+        decision["followup_type"] = None
+        decision["forced_after_two_questions"] = True
+
     extracted_preferences["conversation_decision"] = decision
     logger.info("Conversation decision: %s", decision)
  
@@ -51,7 +65,7 @@ async def chat(payload: ChatRequest) -> ChatResponse | JSONResponse:
                 response = await recommendation_service.create_from_preferences(
                     preferences=extracted_preferences,
                     conversation_id=conversation_id,
-                    limit=5,
+                    limit=3,
                     history=appended_history,
                 )
             except (LLMRateLimitedError, LLMUnavailableError) as exc:
@@ -60,7 +74,7 @@ async def chat(payload: ChatRequest) -> ChatResponse | JSONResponse:
             extracted_preferences = response.preferences
             extracted_preferences["recommendation_count"] = len(response.recommendations)
             extracted_preferences["recommendation_titles"] = [
-                r.movie.title for r in response.recommendations[:5]
+                r.movie.title for r in response.recommendations[:3]
             ]
         else:
             logger.info("Skipping TMDB fetch — follow-up needed")
