@@ -88,36 +88,27 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
             return []
 
         system_prompt = (
-            "You are a JSON-only response engine. "
-            "CRITICAL: You MUST respond with ONLY valid JSON, nothing else. "
-            "No markdown, no explanation, no text before or after. "
-            "Invalid: markdown fences, bullet points, text, numbers. "
-            "Valid: only raw JSON object with key 'recommendations' containing an array. "
-            "If you cannot respond with valid JSON only, return empty array."
+            "You are a JSON generation machine. You ONLY output valid JSON. "
+            "NOTHING ELSE. No text, no markdown, no explanation, no markdown code fences. "
+            "If the input is unclear, output: {\"recommendations\": []} "
+            "VALID OUTPUT EXAMPLE: "
+            "{\"recommendations\": [{\"id\": \"m1\", \"tmdb_id\": 100, \"rank\": 1, \"match_score\": 95, \"reason\": \"Matches preferences\", \"watch_context\": \"Tonight\"}]} "
+            "INVALID: Any text before/after JSON, markdown, bullets, explanation. "
+            "You will ONLY respond with raw JSON object, nothing else."
         )
         
-        # Format user message with clear INPUT/OUTPUT separation to prevent model confusion
-        user_content = f"""INPUTS:
-User Preferences: {json.dumps(preferences, ensure_ascii=True)}
-Candidate Movies: {json.dumps([self._serialize_candidate(m) for m in candidates], ensure_ascii=True)}
+        # Minimal, data-only user prompt to prevent model from explaining/analyzing
+        candidates_data = [self._serialize_candidate(m) for m in candidates]
+        user_content = f"""Rank these movies for user preferences. Return ONLY JSON object with "recommendations" key.
+Preferences: {json.dumps(preferences)}
+Movies: {json.dumps(candidates_data)}
 Limit: {limit}
-
-TASK: Rank the candidate movies based on user preferences. Select up to {limit} movies.
-
-OUTPUT REQUIREMENTS:
-- Must be ONLY a valid JSON object
-- Key: "recommendations" (array)
-- Each item: {{"id": candidate_id, "tmdb_id": tmdb_id_or_null, "rank": 1-{limit}, "match_score": 0-100, "reason": "under 28 words", "watch_context": "under 18 words"}}
-- match_score: integer 0-100 based on genre/mood/tone/runtime match
-- Only use candidates from the input list
-- No text, no markdown, no explanation—ONLY JSON"""
-        
-        user_content_json = user_content
+Format: {{"recommendations": [{{"id": str, "tmdb_id": int|null, "rank": 1, "match_score": 0-100, "reason": str, "watch_context": str}}]}}"""
 
         payload = self._build_payload(
             system_prompt=system_prompt,
-            user_content=user_content_json,
-            temperature=0.2,
+            user_content=user_content,
+            temperature=0.1,
         )
 
         cache_key = self._make_cache_key(payload)
