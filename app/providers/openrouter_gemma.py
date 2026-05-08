@@ -87,28 +87,45 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
         if not candidates:
             return []
 
-        system_prompt = (
-            "You are a JSON generation machine. You ONLY output valid JSON. "
-            "NOTHING ELSE. No text, no markdown, no explanation, no markdown code fences. "
-            "If the input is unclear, output: {\"recommendations\": []} "
-            "VALID OUTPUT EXAMPLE: "
-            "{\"recommendations\": [{\"id\": \"m1\", \"tmdb_id\": 100, \"rank\": 1, \"match_score\": 95, \"reason\": \"Matches preferences\", \"watch_context\": \"Tonight\"}]} "
-            "INVALID: Any text before/after JSON, markdown, bullets, explanation. "
-            "You will ONLY respond with raw JSON object, nothing else."
-        )
-        
-        # Minimal, data-only user prompt to prevent model from explaining/analyzing
         candidates_data = [self._serialize_candidate(m) for m in candidates]
-        user_content = f"""Rank these movies for user preferences. Return ONLY JSON object with "recommendations" key.
-Preferences: {json.dumps(preferences)}
-Movies: {json.dumps(candidates_data)}
-Limit: {limit}
-Format: {{"recommendations": [{{"id": str, "tmdb_id": int|null, "rank": 1, "match_score": 0-100, "reason": str, "watch_context": str}}]}}"""
+
+        system_prompt = (
+            "You are a JSON-only response generator. "
+            "You must output exactly one valid JSON object and nothing else. "
+            "Do not include any explanation, analysis, bullet points, markdown, or text. "
+            "Do not restate the input. If you cannot produce valid JSON, output {\"recommendations\": []}."
+        )
+
+        user_content = json.dumps(
+            {
+                "task": "rank_movies",
+                "preferences": preferences,
+                "candidate_movies": candidates_data,
+                "limit": limit,
+                "response_example": {
+                    "recommendations": [
+                        {
+                            "id": "123",
+                            "tmdb_id": 456,
+                            "rank": 1,
+                            "match_score": 95,
+                            "reason": "Strong match for user preferences.",
+                            "watch_context": "Best for tonight.",
+                        }
+                    ]
+                },
+                "instructions": (
+                    "Respond with EXACTLY one JSON object matching the response_example. "
+                    "No text before or after. No markdown. No explanation. No bullets."
+                ),
+            },
+            ensure_ascii=True,
+        )
 
         payload = self._build_payload(
             system_prompt=system_prompt,
             user_content=user_content,
-            temperature=0.1,
+            temperature=0.0,
         )
 
         cache_key = self._make_cache_key(payload)
@@ -117,8 +134,59 @@ Format: {{"recommendations": [{{"id": str, "tmdb_id": int|null, "rank": 1, "matc
             parsed = self._parse_json_content(cached_content)
         else:
             content = await self._post_and_get_content(payload, session_key)
-            self._set_cached(cache_key, content)
-            parsed = self._parse_json_content(content)
+            try:
+                parsed = self._parse_json_content(content)
+                self._set_cached(cache_key, content)
+            except LLMUnavailableError:
+                logger.warning(
+                    "[LLM] First ranking response invalid; retrying with stricter JSON-only prompt"
+                )
+                retry_user_content = json.dumps(
+                    {
+                        "task": "rank_movies_retry",
+                        "error": "Previous response was not valid JSON.",
+                        "preferences": preferences,
+                        "candidate_movies": candidates_data,
+                        "limit": limit,
+                        "instructions": (
+                            "Respond with EXACTLY one valid JSON object and nothing else. "
+                            "Do not include any text, markdown, bullet points, or explanation."
+                        ),
+                        "response_example": {
+                            "recommendations": [
+                                {
+                                    "id": "123",
+                                    "tmdb_id": 456,
+                                    "rank": 1,
+                                    "match_score": 95,
+                                    "reason": "Strong match for user preferences.",
+                                    "watch_context": "Best for tonight.",
+                                }
+                            ]
+                        },
+                    },
+                    ensure_ascii=True,
+                )
+                retry_payload = self._build_payload(
+                    system_prompt=system_prompt,
+                    user_content=retry_user_content,
+                    temperature=0.0,
+                )
+                retry_content = await self._post_and_get_content(retry_payload, session_key)
+                try:
+                    parsed = self._parse_json_content(retry_content)
+                    self._set_cached(cache_key, retry_content)
+                except LLMUnavailableError:
+                    logger.warning(
+                        "[LLM] Retry response invalid; trying fallback model with same strict instructions"
+                    )
+                    fallback_content = await self._post_and_get_content(
+                        retry_payload,
+                        session_key,
+                        fallback_only=True,
+                    )
+                    parsed = self._parse_json_content(fallback_content)
+                    self._set_cached(cache_key, fallback_content)
 
         recommendations = self._recommendations_from_json(parsed, candidates, limit)
         if recommendations:
@@ -223,6 +291,7 @@ Format: {{"recommendations": [{{"id": str, "tmdb_id": int|null, "rank": 1, "matc
         self,
         payload: dict[str, Any],
         session_key: str | None,
+        fallback_only: bool = False,
     ) -> str:
         """
         Try primary model with primary API key first.
@@ -232,11 +301,15 @@ Format: {{"recommendations": [{{"id": str, "tmdb_id": int|null, "rank": 1, "matc
         """
         await self._respect_cooldown(session_key)
 
-        # Each tuple: (model_name, api_key, max_attempts)
-        models_to_try = [
-            (LLM_PRIMARY_MODEL,  self.settings.gemma_primary_api_key,  2),
-            (LLM_FALLBACK_MODEL, self.settings.gemma_fallback_api_key, 1),
-        ]
+        if fallback_only:
+            models_to_try = [
+                (LLM_FALLBACK_MODEL, self.settings.gemma_fallback_api_key, 2),
+            ]
+        else:
+            models_to_try = [
+                (LLM_PRIMARY_MODEL,  self.settings.gemma_primary_api_key,  2),
+                (LLM_FALLBACK_MODEL, self.settings.gemma_fallback_api_key, 1),
+            ]
 
         async with httpx.AsyncClient(timeout=90) as client:
             for model, api_key, max_attempts in models_to_try:
