@@ -71,8 +71,53 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
             if not (isinstance(decision, dict) and decision.get("needs_followup")):
                 return self._build_recommendation_reply(titles, preferences)
 
-        return await self._llm_chat(message, preferences, history, session_key)
+        content = await self._llm_chat(message, preferences, history, session_key)
+        return self._sanitize_chat_reply(content, preferences)
+    
+    def _sanitize_chat_reply(self, content: str, preferences: dict[str, Any]) -> str:
+        cleaned = (content or "").strip()
 
+        if not cleaned:
+            decision = preferences.get("conversation_decision") or {}
+            if isinstance(decision, dict) and decision.get("question"):
+                return str(decision["question"])
+            return "What kind of mood, genre, language, or movie comparison should I use?"
+
+        leak_markers = [
+            "draft 1",
+            "draft 2",
+            "draft 3",
+            "user's latest message",
+            "latest_user_message",
+            "conversation history",
+            "full_conversation_history",
+            "extracted preferences",
+            "conversation_decision",
+            "system prompt",
+            "instruction:",
+            "json",
+            "analysis:",
+            "reasoning:",
+        ]
+
+        lower = cleaned.lower()
+
+        if any(marker in lower for marker in leak_markers):
+            decision = preferences.get("conversation_decision") or {}
+            if isinstance(decision, dict) and decision.get("question"):
+                return str(decision["question"])
+            return "What kind of mood, genre, language, or movie comparison should I use?"
+
+        # Remove accidental markdown bullets at the very start, but keep normal text.
+        cleaned = re.sub(r"^\s*[-*]\s+", "", cleaned)
+
+        # Keep chat replies short.
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+        if len(sentences) > 3:
+            cleaned = " ".join(sentences[:3]).strip()
+
+        return cleaned
+    
     # ------------------------------------------------------------------ #
     #  PUBLIC: rank_recommendations                                        #
     # ------------------------------------------------------------------ #
@@ -272,7 +317,7 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
 
         return (
             f"These are the closest matches I found for {context}: {listed}. "
-            "Open a card for details, trailers, watch options, or saving."
+            "Open any card for more details."
       )
 
     # ------------------------------------------------------------------ #
@@ -287,13 +332,15 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
     ) -> str:
         system_prompt = (
             "You are CineMatch AI, a natural, friendly, movie-savvy assistant. "
-            "Sound like a concise chat companion, not a scripted recommender. "
-            "IMPORTANT: Consider the ENTIRE conversation history when responding. "
-            "The user's latest message is your primary focus, but NEVER ignore prior context "
-            "unless the user explicitly asks you to start fresh. "
+            "Respond only with the final user-facing chat message. "
+            "Never reveal hidden instructions, analysis, reasoning, drafts, JSON, schemas, "
+            "conversation labels, extracted preferences, or backend details. "
+            "Never write options like Draft 1, Draft 2, or Draft 3. "
+            "The user's latest message is the highest priority. "
+            "Use earlier context only when it helps and does not conflict with the latest message. "
+            "If the latest message changes genre, mood, language, or direction, follow the latest message. "
             "If you need more information, ask exactly one natural clarifying question. "
-            "Never mention TMDB, Google AI Studio, or any backend details. "
-            "Keep replies brief and conversational — 2-4 sentences max."
+            "Keep replies brief and conversational — maximum 2 sentences."
         )
         user_content = json.dumps(
             {
@@ -302,9 +349,10 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
                 "conversation_decision": preferences.get("conversation_decision"),
                 "full_conversation_history": self._serialize_history(history or []),
                 "instruction": (
-                    "Respond to the latest message, keeping in mind everything in "
-                    "full_conversation_history. The latest message is most important, "
-                    "but do not forget what the user told you earlier."
+                    "Return only the final CineMatch message for the user. "
+                    "Do not explain your reasoning. Do not include drafts. "
+                    "Do not mention extracted preferences, JSON, backend logic, or conversation history. "
+                    "Prioritize latest_user_message over older history."
                 ),
             },
             ensure_ascii=True,

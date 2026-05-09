@@ -84,17 +84,23 @@ async def chat(payload: ChatRequest) -> ChatResponse | JSONResponse:
                 recommendations=[],
             )
  
-        # chat() returns locally when recommendations exist — no second LLM call.
-        # Only hits the API for follow-up questions and opening messages.
-        try:
-            assistant_text = await recommendation_service.llm_provider.chat(
-                payload.message,
-                response.preferences,
-                appended_history,
-                session_key=response.conversation_id,
+        # If we already know we need a follow-up question, do NOT call the LLM.
+        # This prevents the model from exposing prompt text, drafts, JSON, or analysis.
+        if decision.get("needs_followup"):
+            assistant_text = (
+                decision.get("question")
+                or "What kind of mood, genre, language, or movie comparison should I use?"
             )
-        except (LLMRateLimitedError, LLMUnavailableError) as exc:
-            return llm_error_response(exc)
+        else:
+            try:
+                assistant_text = await recommendation_service.llm_provider.chat(
+                    payload.message,
+                    response.preferences,
+                    appended_history,
+                    session_key=response.conversation_id,
+                )
+            except (LLMRateLimitedError, LLMUnavailableError) as exc:
+                return llm_error_response(exc)
  
     assistant_message = ChatMessage(role="assistant", content=assistant_text)
  

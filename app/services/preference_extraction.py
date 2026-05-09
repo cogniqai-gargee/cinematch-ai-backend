@@ -14,32 +14,32 @@ class PreferenceExtractionService:
         "action": ["action"],
         "adventure": ["adventure"],
         "animation": ["animated", "animation", "anime"],
-        "comedy": ["comedy", "funny", "humor", "humour", "laugh"],
-        "crime": ["crime", "heist", "gangster", "mafia"],
+        "comedy": ["comedy", "comedies", "funny", "humor", "humour", "laugh"],
+        "crime": ["crime", "crimes", "heist", "heists", "gangster", "mafia"],
         "documentary": ["documentary", "docu"],
         "drama": ["drama", "dramatic", "character piece"],
         "family": ["family", "kids"],
         "fantasy": ["fantasy", "magic", "fairy tale"],
-        "horror": ["horror", "scary"],
-        "mystery": ["mystery", "whodunit"],
-        "romance": ["romance", "romantic", "love story"],
+        "horror": ["horror", "horrors", "scary"],
+        "mystery": ["mystery", "mysteries", "whodunit"],
+        "romance": ["romance", "romances", "romantic", "love story", "love stories"],
         "sci-fi": ["sci-fi", "science fiction", "cyberpunk", "space"],
-        "thriller": ["thriller", "suspense", "suspenseful"],
+        "thriller": ["thriller", "thrillers", "suspense", "suspenseful"],
         "war": ["war"],
         "western": ["western"],
     }
 
     SUBGENRE_KEYWORDS: TermMap = {
-        "romantic comedy": ["romcom", "rom-com", "rom com", "romantic comedy"],
+        "romantic comedy": ["romcom", "romcoms", "rom-com", "rom-coms", "rom com", "rom coms", "romantic comedy", "romantic comedies",],
         "dark comedy": ["dark comedy", "black comedy"],
-        "crime thriller": ["crime thriller"],
-        "psychological thriller": ["psychological thriller"],
+        "crime thriller": ["crime thriller", "crime thrillers"],
+        "psychological thriller": ["psychological thriller", "psychological thrillers"],
         "legal thriller": ["legal thriller", "courtroom thriller"],
         "political thriller": ["political thriller"],
         "supernatural horror": ["supernatural horror"],
         "slasher": ["slasher"],
         "found footage": ["found footage"],
-        "neo-noir": ["neo-noir", "neo noir"],
+        "neo-noir": ["neo-noir", "neo noir", "neo-noirs", "neo noirs"],
         "noir": ["noir"],
         "coming-of-age": ["coming of age", "coming-of-age"],
         "road movie": ["road movie", "road trip movie"],
@@ -184,8 +184,14 @@ class PreferenceExtractionService:
     
     def extract_prioritizing_latest(self, messages: list[str]) -> dict[str, Any]:
         """
-        Extract preferences from the full conversation, but dynamically allow the 
-        latest request to override stale signals.
+        Extract preferences from the whole conversation, but make the latest user
+        message the controlling signal.
+
+        Rules:
+        - If the latest message has a concrete new genre/subgenre, it overrides old genres.
+        - If the latest message has only a mood/tone refinement, it can keep the old genre.
+        - If the latest message is vague, like "suggest me a movie", old stale genres
+          should not silently control the answer.
         """
         base = self.extract(messages)
 
@@ -198,53 +204,219 @@ class PreferenceExtractionService:
         if not latest_text:
             return base
 
-        # Extract what the user asked for *only* in their very last message
         latest = self.extract([latest_message])
 
-        # 1. Determine if the user is ADDING to their request or PIVOTING
-        additive_markers = ["also", "and", "add", "plus", "with", "what about", "how about"]
-        is_additive = any(marker in latest_text for marker in additive_markers)
+        latest_has_genre = bool(latest.get("genres") or latest.get("subgenres"))
+        latest_has_mood = bool(
+            latest.get("moods")
+            or latest.get("tone")
+            or latest.get("themes")
+            or latest.get("pacing")
+            or latest.get("intensity_level")
+        )
+        latest_has_language = bool(latest.get("language") or latest.get("languages"))
+        latest_has_runtime = bool(
+            latest.get("runtime")
+            or latest.get("max_runtime_minutes")
+            or latest.get("min_runtime_minutes")
+            or latest.get("target_runtime_minutes")
+        )
+        latest_has_era = bool(
+            latest.get("era")
+            or latest.get("year")
+            or latest.get("year_start")
+            or latest.get("year_end")
+            or latest.get("popularity_preference")
+        )
+
+        latest_has_any_specific_signal = any(
+            [
+                latest_has_genre,
+                latest_has_mood,
+                latest_has_language,
+                latest_has_runtime,
+                latest_has_era,
+                bool(latest.get("liked_references")),
+            ]
+        )
+
+        latest_is_vague_request = self._is_vague_recommendation_request(latest_text)
+
+        # Very important:
+        # If the latest user message is vague, do not keep old preferences from
+        # older turns. Otherwise "Suggest me a movie" after a thriller request keeps
+        # returning thrillers forever.
+        if latest_is_vague_request and not latest_has_any_specific_signal:
+            latest["latest_message_was_vague"] = True
+            return latest
+
+        is_additive = self._is_additive_request(latest_text)
+        is_refinement = self._is_refinement_request(latest_text)
+        is_explicit_pivot = self._is_explicit_pivot(latest_text)
 
         merged = dict(base)
 
-        # 2. If it's a pivot, clear out the stale data
-        if not is_additive:
-            latest_has_genre = bool(latest.get("genres") or latest.get("subgenres"))
-            latest_has_mood = bool(latest.get("moods") or latest.get("tone") or latest.get("themes"))
-
-            if latest_has_genre:
-                # User gave a new genre. Wipe old genres AND old moods to start fresh.
-                for stale_key in [
-                    "genres", "subgenres", "genre", "genre_summary", "avoid_genres",
-                    "moods", "mood", "mood_tags", "tone", "themes"
-                ]:
-                    merged.pop(stale_key, None)
-                    
-            elif latest_has_mood:
-                # User gave a new mood/tone, but no new genre. Keep the genre, swap the vibe.
-                for stale_key in ["moods", "mood", "mood_tags", "tone", "themes"]:
-                    merged.pop(stale_key, None)
-
-        # 3. Apply the latest signals (either overwriting or combining)
         core_latest_keys = [
-            "genres", "subgenres", "moods", "tone", "pacing", "themes",
-            "language", "languages", "runtime", "max_runtime_minutes",
-            "min_runtime_minutes", "target_runtime_minutes", "era", "year",
-            "year_start", "year_end", "popularity_preference",
-            "viewing_context", "intensity_level"
+            "genres",
+            "subgenres",
+            "moods",
+            "tone",
+            "pacing",
+            "themes",
+            "language",
+            "languages",
+            "runtime",
+            "max_runtime_minutes",
+            "min_runtime_minutes",
+            "target_runtime_minutes",
+            "era",
+            "year",
+            "year_start",
+            "year_end",
+            "popularity_preference",
+            "viewing_context",
+            "intensity_level",
+            "liked_references",
         ]
 
+        # A concrete latest genre/subgenre should become the new direction unless
+        # the user clearly says they are adding it.
+        if latest_has_genre and not is_additive:
+            for stale_key in [
+                "genres",
+                "subgenres",
+                "genre",
+                "genre_summary",
+                "avoid_genres",
+                "moods",
+                "mood",
+                "mood_tags",
+                "tone",
+                "themes",
+                "pacing",
+                "intensity_level",
+            ]:
+                merged.pop(stale_key, None)
+
+        # If the user says "instead", "not that", "change it to", etc.,
+        # clear stale direction even if the extracted latest signal is weak.
+        elif is_explicit_pivot and latest_has_any_specific_signal:
+            for stale_key in [
+                "genres",
+                "subgenres",
+                "genre",
+                "genre_summary",
+                "avoid_genres",
+                "moods",
+                "mood",
+                "mood_tags",
+                "tone",
+                "themes",
+                "pacing",
+                "intensity_level",
+            ]:
+                merged.pop(stale_key, None)
+
+        # Mood-only refinement like "something even edgier" should keep the old
+        # genre but replace the old mood/tone.
+        elif latest_has_mood and not is_additive:
+            for stale_key in ["moods", "mood", "mood_tags", "tone", "themes", "pacing", "intensity_level"]:
+                merged.pop(stale_key, None)
+
         for key in core_latest_keys:
-            if latest.get(key):
-                if is_additive and isinstance(merged.get(key), list):
-                    # Combine lists uniquely while preserving order
-                    merged[key] = list(dict.fromkeys(merged.get(key, []) + latest[key]))
+            latest_value = latest.get(key)
+            if latest_value:
+                if is_additive and isinstance(merged.get(key), list) and isinstance(latest_value, list):
+                    merged[key] = list(dict.fromkeys([*merged.get(key, []), *latest_value]))
                 else:
-                    # Overwrite
-                    merged[key] = latest[key]
+                    merged[key] = latest_value
+
+        merged["latest_user_message"] = latest_message
+        merged["latest_message_was_refinement"] = is_refinement
+        merged["latest_message_was_additive"] = is_additive
+        merged["latest_message_was_pivot"] = is_explicit_pivot or (latest_has_genre and not is_additive)
 
         return self._refresh_derived_preferences(merged)
     
+    def _is_vague_recommendation_request(self, text: str) -> bool:
+        vague_patterns = [
+            r"\bsuggest\s+me\s+(?:a\s+)?(?:movie|film|watch)\b",
+            r"\brecommend\s+me\s+(?:a\s+)?(?:movie|film|watch)\b",
+            r"\bgive\s+me\s+(?:a\s+)?(?:movie|film|watch)\b",
+            r"\bpick\s+(?:a\s+)?(?:movie|film)\b",
+            r"\bwhat\s+should\s+i\s+watch\b",
+            r"\banything\b",
+            r"\bsomething\b",
+        ]
+
+        if not any(re.search(pattern, text) for pattern in vague_patterns):
+            return False
+
+        latest_specific_values = (
+            self._matched_values(text, self.GENRE_KEYWORDS)
+            + self._matched_values(text, self.SUBGENRE_KEYWORDS)
+            + self._matched_values(text, self.MOOD_KEYWORDS)
+            + self._matched_values(text, self.TONE_KEYWORDS)
+            + self._matched_values(text, self.PACING_KEYWORDS)
+            + self._matched_values(text, self.THEME_KEYWORDS)
+            + self._matched_values(text, self.POPULARITY_KEYWORDS)
+        )
+
+        has_language = any(self._contains_phrase(text, keyword) for keyword in self.LANGUAGE_KEYWORDS)
+        has_runtime = bool(
+            re.search(r"\b(?:under|less than|below)\s+\d{2,3}\s*(?:min|mins|minutes)\b", text)
+            or re.search(r"\b\d(?:\.\d)?\s*(?:h|hr|hrs|hour|hours)\b", text)
+        )
+
+        return not latest_specific_values and not has_language and not has_runtime
+
+
+    def _is_additive_request(self, text: str) -> bool:
+        additive_markers = [
+            "also",
+            "add",
+            "plus",
+            "along with",
+            "together with",
+            "as well",
+            "include",
+        ]
+        return any(marker in text for marker in additive_markers)
+
+
+    def _is_refinement_request(self, text: str) -> bool:
+        refinement_markers = [
+            "more",
+            "even more",
+            "less",
+            "a bit",
+            "slightly",
+            "something even",
+            "make it more",
+            "make it less",
+        ]
+        return any(marker in text for marker in refinement_markers)
+
+
+    def _is_explicit_pivot(self, text: str) -> bool:
+        pivot_markers = [
+            "i don't want that",
+            "i dont want that",
+            "do not want that",
+            "not that",
+            "no,",
+            "nope",
+            "instead",
+            "rather",
+            "scratch that",
+            "forget that",
+            "change it to",
+            "switch to",
+            "make it",
+            "actually",
+        ]
+        return any(marker in text for marker in pivot_markers)
+
     def _refresh_derived_preferences(self, preferences: dict[str, Any]) -> dict[str, Any]:
         """Recalculates summary fields after merging or overwriting dictionaries."""
         refreshed = dict(preferences)
@@ -294,6 +466,7 @@ class PreferenceExtractionService:
             "intensity_level",
         ]
         has_specific_signal = any(bool(preferences.get(key)) for key in readiness_keys)
+        latest_was_vague = bool(preferences.get("latest_message_was_vague"))
 
         vague_requests = [
             "recommend",
@@ -314,20 +487,21 @@ class PreferenceExtractionService:
                 "question": contradictions[0],
             }
 
+        if latest_was_vague or has_vague_request or len(text.split()) <= 5:
+            if not has_specific_signal:
+                return {
+                    "ready": False,
+                    "needs_followup": True,
+                    "followup_type": "gather_preferences",
+                    "question": "What kind of mood, genre, language, or movie comparison should I use?",
+                }
+
         if has_specific_signal:
             return {
                 "ready": True,
                 "needs_followup": False,
                 "followup_type": None,
                 "question": None,
-            }
-
-        if has_vague_request or len(text.split()) <= 5:
-            return {
-                "ready": False,
-                "needs_followup": True,
-                "followup_type": "gather_preferences",
-                "question": "What kind of mood, genre, or movie comparison should I use?",
             }
 
         return {
