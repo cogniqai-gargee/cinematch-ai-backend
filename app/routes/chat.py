@@ -39,7 +39,7 @@ async def chat(payload: ChatRequest) -> ChatResponse | JSONResponse:
     appended_history   = [*payload.history, user_message]
     user_texts = [m.content for m in payload.history if m.role == "user"] + [payload.message]
  
-    extracted_preferences = preference_service.extract(user_texts)
+    extracted_preferences = preference_service.extract_prioritizing_latest(user_texts)
     decision = preference_service.assess(payload.message, extracted_preferences)
 
     assistant_question_count = sum(

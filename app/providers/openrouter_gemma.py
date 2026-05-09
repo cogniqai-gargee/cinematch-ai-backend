@@ -271,8 +271,8 @@ class OpenRouterGemmaProvider(BaseLLMProvider):
         listed = ", ".join(f'"{t}"' for t in display_titles)
 
         return (
-            f"Here are my top {len(display_titles)} picks for {context}: {listed}. "
-            "Tap any movie to view the trailer, save it, mark it watched, or check where to watch."
+            f"These are the closest matches I found for {context}: {listed}. "
+            "Open a card for details, trailers, watch options, or saving."
       )
 
     # ------------------------------------------------------------------ #

@@ -181,6 +181,100 @@ class PreferenceExtractionService:
             logger.info("Extracted preferences after message %s: %s", index + 1, self._finalize(state))
 
         return self._finalize(state)
+    
+    def extract_prioritizing_latest(self, messages: list[str]) -> dict[str, Any]:
+        """
+        Extract preferences from the full conversation, but dynamically allow the 
+        latest request to override stale signals.
+        """
+        base = self.extract(messages)
+
+        if not messages:
+            return base
+
+        latest_message = messages[-1].strip()
+        latest_text = latest_message.lower()
+
+        if not latest_text:
+            return base
+
+        # Extract what the user asked for *only* in their very last message
+        latest = self.extract([latest_message])
+
+        # 1. Determine if the user is ADDING to their request or PIVOTING
+        additive_markers = ["also", "and", "add", "plus", "with", "what about", "how about"]
+        is_additive = any(marker in latest_text for marker in additive_markers)
+
+        merged = dict(base)
+
+        # 2. If it's a pivot, clear out the stale data
+        if not is_additive:
+            latest_has_genre = bool(latest.get("genres") or latest.get("subgenres"))
+            latest_has_mood = bool(latest.get("moods") or latest.get("tone") or latest.get("themes"))
+
+            if latest_has_genre:
+                # User gave a new genre. Wipe old genres AND old moods to start fresh.
+                for stale_key in [
+                    "genres", "subgenres", "genre", "genre_summary", "avoid_genres",
+                    "moods", "mood", "mood_tags", "tone", "themes"
+                ]:
+                    merged.pop(stale_key, None)
+                    
+            elif latest_has_mood:
+                # User gave a new mood/tone, but no new genre. Keep the genre, swap the vibe.
+                for stale_key in ["moods", "mood", "mood_tags", "tone", "themes"]:
+                    merged.pop(stale_key, None)
+
+        # 3. Apply the latest signals (either overwriting or combining)
+        core_latest_keys = [
+            "genres", "subgenres", "moods", "tone", "pacing", "themes",
+            "language", "languages", "runtime", "max_runtime_minutes",
+            "min_runtime_minutes", "target_runtime_minutes", "era", "year",
+            "year_start", "year_end", "popularity_preference",
+            "viewing_context", "intensity_level"
+        ]
+
+        for key in core_latest_keys:
+            if latest.get(key):
+                if is_additive and isinstance(merged.get(key), list):
+                    # Combine lists uniquely while preserving order
+                    merged[key] = list(dict.fromkeys(merged.get(key, []) + latest[key]))
+                else:
+                    # Overwrite
+                    merged[key] = latest[key]
+
+        return self._refresh_derived_preferences(merged)
+    
+    def _refresh_derived_preferences(self, preferences: dict[str, Any]) -> dict[str, Any]:
+        """Recalculates summary fields after merging or overwriting dictionaries."""
+        refreshed = dict(preferences)
+
+        if refreshed.get("genres"):
+            refreshed["genre_summary"] = " + ".join(refreshed["genres"])
+            refreshed["genre"] = refreshed["genre_summary"]
+        else:
+            refreshed.pop("genre_summary", None)
+            refreshed.pop("genre", None)
+
+        if refreshed.get("moods"):
+            refreshed["mood"] = refreshed["moods"][-1]
+            refreshed["mood_tags"] = refreshed["moods"]
+        else:
+            refreshed.pop("mood", None)
+            refreshed.pop("mood_tags", None)
+
+        if refreshed.get("popularity_preference"):
+            refreshed["vibe"] = refreshed["popularity_preference"]
+        else:
+            refreshed.pop("vibe", None)
+
+        avoid_genres = self._avoid_genres(refreshed)
+        if avoid_genres:
+            refreshed["avoid_genres"] = avoid_genres
+        else:
+            refreshed.pop("avoid_genres", None)
+
+        return refreshed
 
     def assess(self, latest_message: str, preferences: dict[str, Any]) -> dict[str, Any]:
         text = latest_message.lower()
@@ -405,6 +499,12 @@ class PreferenceExtractionService:
         if "crime thriller" in subgenres:
             self._add_unique(state["genres"], "crime")
             self._add_unique(state["genres"], "thriller")
+
+        if "neo-noir" in subgenres or "noir" in subgenres:
+            self._add_unique(state["genres"], "crime")
+            self._add_unique(state["genres"], "thriller")
+            self._add_unique(state["moods"], "dark")
+            self._add_unique(state["tone"], "stylish")
 
     def _refine_overlapping_signals(self, state: dict[str, Any], text: str) -> None:
         if "dark humor" in state["moods"] and "dark" in state["moods"]:
